@@ -9,6 +9,8 @@ import time
 import hashlib
 import secrets
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.parse
 
 # ============================================
 # НАСТРОЙКИ
@@ -19,12 +21,13 @@ HOST = '0.0.0.0'
 users = {}
 chats = {}
 invites = {}
-messages_count = 0
-chat_counter = 0
+messages = {}  # {chat_id: [сообщения]}
+active_connections = {}  # {user: connection}
+message_queue = {}  # {user: [сообщения]}
 
 print(f"""
 ============================================
-🚀 МОЛЧА - Сервер
+🚀 МОЛЧА - Сервер (HTTP mode)
 👤 Создатель: Stardamnplugg (2026)
 ============================================
 📡 Порт: {PORT}
@@ -45,121 +48,196 @@ def verify_password(password, stored_hash, salt):
     return key.hex() == stored_hash
 
 # ============================================
-# ОСНОВНОЙ СЕРВЕР
+# HTTP HANDLER (все запросы через HTTP)
 # ============================================
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind((HOST, PORT))
-server.listen(20)
-print(f"[{get_time()}] ✅ Сервер запущен, жду подключения...")
-
-def handle_client(conn, addr):
-    global chat_counter, messages_count
-    name = None
-    
-    try:
-        data = conn.recv(4096).decode()
-        if not data:
-            return
-            
-        msg = json.loads(data)
+class MolchaHTTPHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        """GET запросы - статус"""
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
         
-        if msg['type'] == 'login':
-            name = msg['name']
-            password = msg['password']
+        online = len([u for u in users.values() if u.get('online')])
+        html = f"""
+        <html>
+        <head>
+            <title>МОЛЧА</title>
+            <style>
+                body {{ font-family: monospace; padding: 20px; background: #000; color: #0f0; }}
+                .container {{ max-width: 800px; margin: 0 auto; }}
+                .header {{ border-bottom: 2px solid #0f0; padding: 10px; }}
+                .stats {{ margin: 20px 0; }}
+                .online {{ color: #0f0; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>🚀 МОЛЧА</h1>
+                    <p>Создатель: Stardamnplugg (2026)</p>
+                </div>
+                <div class="stats">
+                    <h3>Статус: <span class="online">ОНЛАЙН</span></h3>
+                    <p>Пользователей онлайн: {online}</p>
+                    <p>Всего пользователей: {len(users)}</p>
+                    <p>Активных чатов: {len(chats)}</p>
+                    <p>Время: {get_time()}</p>
+                </div>
+                <div class="online">
+                    <h3>Сейчас онлайн:</h3>
+                    <ul>
+                    {''.join([f'<li>{u}</li>' for u in users.keys() if users[u].get('online')])}
+                    </ul>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        self.wfile.write(html.encode())
+    
+    def do_POST(self):
+        """POST запросы - все команды чата"""
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
+        
+        try:
+            data = json.loads(post_data.decode())
+            response = self.handle_chat_command(data)
             
-            if name in users:
-                if verify_password(password, users[name]['password_hash'], users[name]['salt']):
-                    users[name]['conn'] = conn
-                    users[name]['online'] = True
-                    users[name]['ip'] = addr[0]
-                    print(f"[{get_time()}] ✅ {name} вошел")
-                else:
-                    conn.send(json.dumps({"type": "error", "text": "❌ Неверный пароль"}).encode())
-                    return
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode())
+            
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+    
+    def handle_chat_command(self, data):
+        """Обработка команд чата"""
+        cmd = data.get('command')
+        user = data.get('user')
+        password = data.get('password')
+        
+        # Логин/регистрация
+        if cmd == 'login':
+            if user in users:
+                if verify_password(password, users[user]['password_hash'], users[user]['salt']):
+                    users[user]['online'] = True
+                    users[user]['last_seen'] = time.time()
+                    return {
+                        "status": "ok",
+                        "users": [u for u in users.keys() if users[u].get('online') and u != user]
+                    }
             else:
                 password_hash, salt = hash_password(password)
-                users[name] = {
-                    'conn': conn,
+                users[user] = {
                     'online': True,
-                    'ip': addr[0],
                     'password_hash': password_hash,
-                    'salt': salt
+                    'salt': salt,
+                    'last_seen': time.time()
                 }
-                print(f"[{get_time()}] ✨ Новый пользователь: {name}")
+                return {
+                    "status": "ok",
+                    "users": [u for u in users.keys() if users[u].get('online') and u != user]
+                }
+            return {"status": "error", "message": "Неверный пароль"}
+        
+        # Получить список пользователей
+        elif cmd == 'get_users':
+            if user in users and users[user].get('online'):
+                return {
+                    "status": "ok",
+                    "users": [u for u in users.keys() if users[u].get('online') and u != user]
+                }
+        
+        # Отправить приглашение
+        elif cmd == 'invite':
+            to = data.get('to')
+            if to in users and users[to].get('online'):
+                if to not in message_queue:
+                    message_queue[to] = []
+                message_queue[to].append({
+                    "type": "invite",
+                    "from": user
+                })
+                return {"status": "ok", "message": "Приглашение отправлено"}
+        
+        # Принять приглашение
+        elif cmd == 'accept':
+            from_user = data.get('from')
+            chat_id = f"{min(user, from_user)}_{max(user, from_user)}"
             
-            # Отправляем список пользователей
-            user_list = [u for u in users.keys() if u != name and users[u].get('online')]
-            conn.send(json.dumps({"type": "user_list", "users": user_list}).encode())
+            if chat_id not in chats:
+                chats[chat_id] = [user, from_user]
+                messages[chat_id] = []
             
-            # Основной цикл
-            while True:
-                data = conn.recv(4096).decode()
-                if not data:
-                    break
-                    
-                msg = json.loads(data)
+            return {"status": "ok", "chat_id": chat_id}
+        
+        # Отправить сообщение
+        elif cmd == 'send_message':
+            chat_id = data.get('chat_id')
+            text = data.get('text')
+            
+            if chat_id in chats:
+                if chat_id not in messages:
+                    messages[chat_id] = []
                 
-                if msg['type'] == 'get_users':
-                    user_list = [u for u in users.keys() if u != name and users[u].get('online')]
-                    conn.send(json.dumps({"type": "user_list", "users": user_list}).encode())
+                msg = {
+                    "from": user,
+                    "text": text,
+                    "time": get_time()
+                }
+                messages[chat_id].append(msg)
                 
-                elif msg['type'] == 'invite':
-                    to = msg['to']
-                    if to in users and users[to].get('online'):
-                        if to not in invites:
-                            invites[to] = []
-                        if name not in invites[to]:
-                            invites[to].append(name)
-                        users[to]['conn'].send(json.dumps({"type": "invite", "from": name}).encode())
-                        conn.send(json.dumps({"type": "info", "text": f"✅ Приглашение отправлено"}).encode())
-                    else:
-                        conn.send(json.dumps({"type": "error", "text": f"❌ {to} не в сети"}).encode())
+                # Добавляем в очередь для другого пользователя
+                for u in chats[chat_id]:
+                    if u != user and u in users and users[u].get('online'):
+                        if u not in message_queue:
+                            message_queue[u] = []
+                        message_queue[u].append({
+                            "type": "message",
+                            "chat_id": chat_id,
+                            "from": user,
+                            "text": text,
+                            "time": get_time()
+                        })
                 
-                elif msg['type'] == 'accept':
-                    from_user = msg['from']
-                    chat_counter += 1
-                    chat_id = f"chat_{chat_counter}"
-                    chats[chat_id] = [name, from_user]
-                    
-                    if name in invites and from_user in invites[name]:
-                        invites[name].remove(from_user)
-                    
-                    conn.send(json.dumps({"type": "chat_created", "chat_id": chat_id, "with": from_user}).encode())
-                    if from_user in users:
-                        users[from_user]['conn'].send(json.dumps({"type": "chat_created", "chat_id": chat_id, "with": name}).encode())
-                    print(f"[{get_time()}] 💬 Новый чат: {name} и {from_user}")
-                
-                elif msg['type'] == 'message':
-                    chat_id = msg['chat_id']
-                    text = msg['text']
-                    messages_count += 1
-                    
-                    if chat_id in chats:
-                        for user in chats[chat_id]:
-                            if user != name and user in users:
-                                try:
-                                    users[user]['conn'].send(json.dumps({
-                                        "type": "chat_message",
-                                        "chat_id": chat_id,
-                                        "from": name,
-                                        "text": text
-                                    }).encode())
-                                except:
-                                    pass
-                    
-    except Exception as e:
-        print(f"[{get_time()}] Ошибка: {e}")
-    finally:
-        if name and name in users:
-            users[name]['online'] = False
-            print(f"[{get_time()}] ❌ {name} отключился")
-        conn.close()
+                return {"status": "ok"}
+        
+        # Получить новые сообщения
+        elif cmd == 'poll':
+            if user in message_queue and message_queue[user]:
+                queue = message_queue[user]
+                message_queue[user] = []
+                return {"status": "ok", "messages": queue}
+            return {"status": "ok", "messages": []}
+        
+        # Получить историю чата
+        elif cmd == 'get_history':
+            chat_id = data.get('chat_id')
+            if chat_id in messages:
+                return {"status": "ok", "messages": messages[chat_id]}
+        
+        return {"status": "error", "message": "Неизвестная команда"}
+    
+    def log_message(self, format, *args):
+        pass
 
-# Главный цикл
-while True:
+# ============================================
+# ЗАПУСК
+# ============================================
+def main():
+    # Запускаем HTTP сервер
+    server = HTTPServer((HOST, PORT), MolchaHTTPHandler)
+    print(f"[{get_time()}] ✅ Сервер запущен, жду подключения...")
+    print(f"[{get_time()}] 🌍 http://{os.environ.get('RAILWAY_STATIC_URL', 'localhost')}:{PORT}")
+    
     try:
-        conn, addr = server.accept()
-        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
-    except Exception as e:
-        print(f"[{get_time()}] Ошибка: {e}")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print(f"\n[{get_time()}] 👋 Сервер остановлен")
+
+if __name__ == "__main__":
+    main()
